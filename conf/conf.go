@@ -3,6 +3,7 @@ package conf
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/viper"
 )
@@ -14,6 +15,7 @@ type Conf struct {
 	LogConfig   LogConfig    `mapstructure:"Log"`
 	NodeConfigs []NodeConfig `mapstructure:"Nodes"`
 	PprofPort   int          `mapstructure:"PprofPort"`
+	ConfigDir   string       `mapstructure:"-"` // auto-set from config file path
 }
 
 type LogConfig struct {
@@ -54,6 +56,7 @@ func (p *Conf) LoadFromPath(filePath string) error {
 	if err := v.Unmarshal(p); err != nil {
 		return fmt.Errorf("unmarshal config error: %s", err)
 	}
+	p.ConfigDir = filepath.Dir(filePath)
 	for i := range p.NodeConfigs {
 		if p.NodeConfigs[i].RetryCount == nil {
 			p.NodeConfigs[i].RetryCount = intPtr(DefaultNodeRetryCount)
