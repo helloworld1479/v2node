@@ -1,0 +1,9 @@
+[
+    {
+        "protocol": "freedom",
+        "tag": "Default",
+        "settings": {
+            "domainStrategy": "UseIPv4"
+        }
+    }
+]
