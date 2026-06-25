@@ -3,9 +3,14 @@ package core
 import (
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
+	log "github.com/sirupsen/logrus"
 	panel "github.com/wyx2685/v2node/api/v2board"
+	"github.com/wyx2685/v2node/common/file"
 	"github.com/xtls/xray-core/app/dns"
 	"github.com/xtls/xray-core/app/router"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -25,12 +30,24 @@ func hasPublicIPv6() bool {
 			continue
 		}
 		ip := ipNet.IP
-		// Check if it's IPv6, not loopback, not link-local, not private/ULA
 		if ip.To4() == nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsPrivate() {
 			return true
 		}
 	}
 	return false
+}
+
+// hasWorkingIPv6 checks if IPv6 connectivity actually works by TCP probing
+func hasWorkingIPv6() bool {
+	if !hasPublicIPv6() {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp6", "[2001:4860:4860::8888]:53", 3*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 func hasOutboundWithTag(list []*core.OutboundHandlerConfig, tag string) bool {
@@ -42,31 +59,120 @@ func hasOutboundWithTag(list []*core.OutboundHandlerConfig, tag string) bool {
 	return false
 }
 
-func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHandlerConfig, *router.Config, error) {
-	//dns
-	queryStrategy := "UseIPv4v6"
-	if !hasPublicIPv6() {
-		queryStrategy = "UseIPv4"
+// loadDnsConfig loads dns.json from configDir if it exists, otherwise returns smart defaults
+func loadDnsConfig(configDir string) *coreConf.DNSConfig {
+	dnsPath := filepath.Join(configDir, "dns.json")
+	if file.IsExist(dnsPath) {
+		data, err := os.ReadFile(dnsPath)
+		if err != nil {
+			log.WithField("err", err).Warn("Failed to read dns.json, using defaults")
+		} else {
+			dnsConf := &coreConf.DNSConfig{}
+			if err := json.Unmarshal(data, dnsConf); err != nil {
+				log.WithField("err", err).Warn("Failed to parse dns.json, using defaults")
+			} else {
+				log.Info("Loaded custom dns.json")
+				return dnsConf
+			}
+		}
 	}
-	coreDnsConfig := &coreConf.DNSConfig{
+	// Default: use public DNS with IPv6 auto-detection
+	queryStrategy := "UseIPv4"
+	if hasWorkingIPv6() {
+		queryStrategy = "UseIPv4v6"
+	}
+	log.Infof("No dns.json found, using defaults (queryStrategy=%s)", queryStrategy)
+	return &coreConf.DNSConfig{
 		Servers: []*coreConf.NameServerConfig{
 			{
 				Address: &coreConf.Address{
-					Address: xnet.ParseAddress("localhost"),
+					Address: xnet.ParseAddress("8.8.8.8"),
+				},
+			},
+			{
+				Address: &coreConf.Address{
+					Address: xnet.ParseAddress("1.1.1.1"),
 				},
 			},
 		},
 		QueryStrategy: queryStrategy,
 	}
-	//outbound
-	defaultoutbound, _ := buildDefaultOutbound()
-	coreOutboundConfig := append([]*core.OutboundHandlerConfig{}, defaultoutbound)
+}
+
+// loadCustomOutbound loads custom_outbound.json from configDir if it exists
+func loadCustomOutbound(configDir string) []*core.OutboundHandlerConfig {
+	outPath := filepath.Join(configDir, "custom_outbound.json")
+	if !file.IsExist(outPath) {
+		return nil
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		log.WithField("err", err).Warn("Failed to read custom_outbound.json")
+		return nil
+	}
+	var outbounds []coreConf.OutboundDetourConfig
+	if err := json.Unmarshal(data, &outbounds); err != nil {
+		log.WithField("err", err).Warn("Failed to parse custom_outbound.json")
+		return nil
+	}
+	var result []*core.OutboundHandlerConfig
+	for i, o := range outbounds {
+		built, err := o.Build()
+		if err != nil {
+			log.WithFields(log.Fields{"err": err, "index": i, "tag": o.Tag}).Warn("Failed to build custom outbound")
+			continue
+		}
+		result = append(result, built)
+	}
+	log.Infof("Loaded %d custom outbound(s) from custom_outbound.json", len(result))
+	return result
+}
+
+// loadCustomRoute loads route.json from configDir if it exists
+func loadCustomRoute(configDir string) []json.RawMessage {
+	routePath := filepath.Join(configDir, "route.json")
+	if !file.IsExist(routePath) {
+		return nil
+	}
+	data, err := os.ReadFile(routePath)
+	if err != nil {
+		log.WithField("err", err).Warn("Failed to read route.json")
+		return nil
+	}
+	var rules []json.RawMessage
+	if err := json.Unmarshal(data, &rules); err != nil {
+		log.WithField("err", err).Warn("Failed to parse route.json")
+		return nil
+	}
+	log.Infof("Loaded %d custom route rule(s) from route.json", len(rules))
+	return rules
+}
+
+func GetCustomConfig(configDir string, infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHandlerConfig, *router.Config, error) {
+	// === DNS ===
+	coreDnsConfig := loadDnsConfig(configDir)
+
+	// === Outbound ===
+	defaultOutbound, _ := buildDefaultOutbound()
+	coreOutboundConfig := []*core.OutboundHandlerConfig{defaultOutbound}
 	block, _ := buildBlockOutbound()
 	coreOutboundConfig = append(coreOutboundConfig, block)
-	dns, _ := buildDnsOutbound()
-	coreOutboundConfig = append(coreOutboundConfig, dns)
+	dnsOut, _ := buildDnsOutbound()
+	coreOutboundConfig = append(coreOutboundConfig, dnsOut)
 
-	//route
+	// Load custom outbounds from file — override Default if tag matches
+	if customOutbounds := loadCustomOutbound(configDir); len(customOutbounds) > 0 {
+		for _, co := range customOutbounds {
+			if co.Tag == "Default" {
+				// Replace the default freedom outbound
+				coreOutboundConfig[0] = co
+			} else if !hasOutboundWithTag(coreOutboundConfig, co.Tag) {
+				coreOutboundConfig = append(coreOutboundConfig, co)
+			}
+		}
+	}
+
+	// === Route ===
 	domainStrategy := "AsIs"
 	dnsRule, _ := json.Marshal(map[string]interface{}{
 		"port":        "53",
@@ -78,6 +184,12 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
 		DomainStrategy: &domainStrategy,
 	}
 
+	// Load custom route rules from file
+	if customRules := loadCustomRoute(configDir); len(customRules) > 0 {
+		coreRouterConfig.RuleList = append(coreRouterConfig.RuleList, customRules...)
+	}
+
+	// === Panel-derived routes (from each node's Routes config) ===
 	for _, info := range infos {
 		if len(info.Common.Routes) == 0 {
 			continue
